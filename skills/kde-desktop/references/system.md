@@ -77,7 +77,8 @@ nmcli radio wifi on|off
 nmcli connection up "<name>"
 ```
 
-Bluetooth: `bluez` is not installed on this machine, so there is no Bluetooth daemon to control.
+Bluetooth: needs `bluez` + `bluez-utils` (`bluetoothctl power on|off`, `bluetoothctl devices`,
+`bluetoothctl connect <MAC>`). If `org.bluez` cannot be activated, no Bluetooth daemon is installed.
 
 ## Notifications (do not disturb)
 
