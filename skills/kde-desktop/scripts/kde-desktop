@@ -1,0 +1,1708 @@
+#!/usr/bin/env python3
+"""kde-desktop: agent-oriented control of a KDE Plasma 6 Wayland session.
+
+Output contract
+  stdout  compact JSON (one object, or JSON lines for lists); `a11y tree` prints an outline.
+  stderr  on failure, one JSON object {"error", "hint", "trace_id", ...}.
+  exit    0 ok | 1 runtime error | 2 usage | 3 missing dependency/environment
+          4 target not found or ambiguous | 5 refused for safety
+
+Backends
+  KWin scripting over D-Bus (windows, desktops, cursor), AT-SPI (semantic UI access),
+  ydotool (keyboard/pointer injection), spectacle + ImageMagick (screenshots),
+  tesseract (OCR), wl-clipboard, playerctl, wpctl, notify-send, kstart.
+
+Diagnostics are written as JSON lines to $XDG_STATE_HOME/kde-desktop/kde-desktop.log
+(level via KDE_DESKTOP_LOG_LEVEL, default "info").
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import logging
+import logging.handlers
+import os
+import re
+import shutil
+import socket
+import subprocess
+import sys
+import tempfile
+import time
+import uuid
+import warnings
+from datetime import datetime, timezone
+from pathlib import Path
+
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+
+VERSION = "1.0.0"
+TRACE_ID = uuid.uuid4().hex[:12]
+EXIT_OK, EXIT_ERR, EXIT_USAGE, EXIT_ENV, EXIT_TARGET, EXIT_SAFETY = 0, 1, 2, 3, 4, 5
+REQUIRED_ENV = ("WAYLAND_DISPLAY", "DBUS_SESSION_BUS_ADDRESS", "XDG_RUNTIME_DIR")
+
+
+# =========================================================================== logging
+
+class JsonFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        entry = {
+            "timestamp": datetime.fromtimestamp(record.created, timezone.utc).isoformat(timespec="milliseconds"),
+            "level": record.levelname.lower(),
+            "context": getattr(record, "ctx", record.name),
+            "message": record.getMessage(),
+            "trace_id": TRACE_ID,
+        }
+        data = getattr(record, "data", None)
+        if data:
+            entry["data"] = data
+        if record.exc_info:
+            entry["error"] = repr(record.exc_info[1])
+            entry["stack"] = self.formatException(record.exc_info)
+        return json.dumps(entry, default=str, ensure_ascii=False)
+
+
+_logger = logging.getLogger("kde-desktop")
+
+
+def setup_logging() -> None:
+    state = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "kde-desktop"
+    level = getattr(logging, os.environ.get("KDE_DESKTOP_LOG_LEVEL", "info").upper(), logging.INFO)
+    _logger.setLevel(level)
+    try:
+        state.mkdir(parents=True, exist_ok=True)
+        handler = logging.handlers.RotatingFileHandler(state / "kde-desktop.log", maxBytes=1_000_000, backupCount=3)
+        handler.setFormatter(JsonFormatter())
+        _logger.addHandler(handler)
+    except OSError as exc:  # logging must never stop the tool from working
+        sys.stderr.write(json.dumps({"level": "warn", "message": f"file logging disabled: {exc}"}) + "\n")
+        _logger.addHandler(logging.NullHandler())
+
+
+def log(level: str, ctx: str, msg: str, exc: bool = False, **data) -> None:
+    _logger.log(getattr(logging, level.upper()), msg, exc_info=exc, extra={"ctx": ctx, "data": data or None})
+
+
+def fingerprint(text: str) -> dict:
+    """Identify user-supplied text in logs without recording it (it may be a password)."""
+    return {"len": len(text), "sha256_8": hashlib.sha256(text.encode()).hexdigest()[:8]}
+
+
+class CliError(Exception):
+    def __init__(self, message: str, hint: str | None = None, code: int = EXIT_ERR, **data):
+        super().__init__(message)
+        self.hint, self.code, self.data = hint, code, data
+
+
+def emit(obj) -> None:
+    sys.stdout.write(json.dumps(obj, ensure_ascii=False, default=str) + "\n")
+
+
+def emit_lines(items) -> None:
+    for item in items:
+        emit(item)
+
+
+# =========================================================================== process helpers
+
+INSTALL_HINTS = {
+    "ydotool": "sudo pacman -S ydotool",
+    "spectacle": "sudo pacman -S spectacle",
+    "magick": "sudo pacman -S imagemagick",
+    "wl-copy": "sudo pacman -S wl-clipboard",
+    "wl-paste": "sudo pacman -S wl-clipboard",
+    "playerctl": "sudo pacman -S playerctl",
+    "wpctl": "sudo pacman -S wireplumber",
+    "notify-send": "sudo pacman -S libnotify",
+    "tesseract": "sudo pacman -S tesseract tesseract-data-eng",
+    "kstart": "sudo pacman -S kde-cli-tools",
+    "systemctl": "systemd is required",
+}
+
+
+def run(cmd: list[str], *, timeout: float = 10, input: str | None = None, check: bool = True,
+        ctx: str = "run", redact: bool = False, env: dict | None = None) -> subprocess.CompletedProcess:
+    shown = [cmd[0], "<redacted>"] if redact else cmd
+    t0 = time.monotonic()
+    try:
+        proc = subprocess.run(cmd, input=input, capture_output=True, text=True, timeout=timeout,
+                              env={**os.environ, **env} if env else None)
+    except FileNotFoundError as exc:
+        log("error", ctx, "executable not found", exc=True, cmd=shown)
+        raise CliError(f"{cmd[0]} is not installed", hint=INSTALL_HINTS.get(cmd[0]), code=EXIT_ENV) from exc
+    except subprocess.TimeoutExpired as exc:
+        log("warning", ctx, "subprocess timed out", cmd=shown, timeout_s=timeout)
+        raise CliError(f"{cmd[0]} timed out after {timeout}s") from exc
+    log("debug", ctx, "subprocess finished", cmd=shown, rc=proc.returncode, ms=int((time.monotonic() - t0) * 1000))
+    if check and proc.returncode != 0:
+        log("error", ctx, "subprocess failed", cmd=shown, rc=proc.returncode, stderr=(proc.stderr or "")[-800:])
+        raise CliError(f"{cmd[0]} failed (rc={proc.returncode}): {(proc.stderr or '').strip()[-400:]}")
+    return proc
+
+
+def require_env() -> None:
+    missing = [name for name in REQUIRED_ENV if not os.environ.get(name)]
+    if missing:
+        log("error", "startup", "required environment missing", missing=missing)
+        raise CliError(f"not inside a Plasma Wayland session: missing {', '.join(missing)}",
+                       hint="run from a shell inside the logged-in KDE session", code=EXIT_ENV)
+
+
+def runtime_dir() -> Path:
+    path = Path(os.environ["XDG_RUNTIME_DIR"]) / "kde-desktop"
+    path.mkdir(mode=0o700, exist_ok=True)
+    return path
+
+
+def parent_pid(pid: int) -> int | None:
+    try:
+        with open(f"/proc/{pid}/status") as fh:
+            return next(int(line.split()[1]) for line in fh if line.startswith("PPid:"))
+    except (OSError, StopIteration, ValueError):
+        return None
+
+
+def self_ancestor_pids() -> set[int]:
+    """PIDs of this process and its ancestors: the terminal hosting the caller is among them."""
+    pids, pid = set(), os.getpid()
+    while pid and pid > 1 and pid not in pids:
+        pids.add(pid)
+        pid = parent_pid(pid)
+    return pids
+
+
+def pid_related(a: int, b: int, depth: int = 4) -> bool:
+    """Same process, or one a near ancestor of the other. Multi-process apps (Firefox, Electron)
+    expose their window and their accessibility tree from different PIDs."""
+    if a == b:
+        return True
+    for child, anc in ((a, b), (b, a)):
+        cur = child
+        for _ in range(depth):
+            cur = parent_pid(cur) if cur else None
+            if not cur or cur <= 1:
+                break
+            if cur == anc:
+                return True
+    return False
+
+
+# =========================================================================== KWin bridge
+
+def _gio():
+    import gi
+    gi.require_version("Gio", "2.0")
+    from gi.repository import Gio, GLib
+    return Gio, GLib
+
+
+JS_PRELUDE = r"""
+const ARGS = __ARGS__;
+function reply(o) { callDBus(__DEST__, "/Bridge", "local.kdedesktop.Bridge", "Result", JSON.stringify(o)); }
+function geo(r) { return {x: Math.round(r.x), y: Math.round(r.y), w: Math.round(r.width), h: Math.round(r.height)}; }
+function wid(w) { return w.internalId.toString().replace(/[{}]/g, ""); }
+function info(w) {
+  return {id: wid(w), title: w.caption, class: w.resourceClass, pid: w.pid,
+    frame: geo(w.frameGeometry), client: geo(w.clientGeometry),
+    active: w === workspace.activeWindow, minimized: w.minimized, fullscreen: w.fullScreen,
+    keep_above: w.keepAbove, skip_taskbar: w.skipTaskbar, dialog: w.dialog,
+    desktops: w.onAllDesktops ? "all" : w.desktops.map(d => d.x11DesktopNumber),
+    output: w.output ? w.output.name : null, stacking: w.stackingOrder};
+}
+function managed() { return workspace.windowList().filter(w => w.normalWindow || w.dialog); }
+function byId(id) {
+  const w = workspace.windowList().find(w => wid(w) === id);
+  if (!w) throw new Error("window not found: " + id);
+  return w;
+}
+"""
+
+JS_WRAP = """
+try { reply({ok: true, value: (function () { %s })()}); }
+catch (e) { reply({ok: false, error: String(e), stack: String(e.stack || "")}); }
+"""
+
+BRIDGE_XML = """<node><interface name="local.kdedesktop.Bridge">
+<method name="Result"><arg type="s" direction="in"/></method></interface></node>"""
+
+
+def kwin_eval(body: str, args: dict | None = None, timeout: float = 3.0):
+    """Run a JavaScript snippet inside KWin and return its value.
+
+    KWin scripts cannot return values over D-Bus, so the script calls back into a temporary
+    object registered on this process's own bus connection (addressed by its unique name).
+    """
+    Gio, GLib = _gio()
+    t0 = time.monotonic()
+    try:
+        bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+    except Exception as exc:
+        log("error", "kwin", "session bus unavailable", exc=True)
+        raise CliError("cannot connect to the D-Bus session bus", code=EXIT_ENV) from exc
+    result: dict = {}
+    loop = GLib.MainLoop()
+
+    def on_call(_conn, _sender, _path, _iface, _method, params, invocation):
+        result["raw"] = params.unpack()[0]
+        invocation.return_value(None)
+        loop.quit()
+
+    node = Gio.DBusNodeInfo.new_for_xml(BRIDGE_XML)
+    reg_id = bus.register_object("/Bridge", node.interfaces[0], on_call, None, None)
+    script = (JS_PRELUDE.replace("__ARGS__", json.dumps(args or {}))
+              .replace("__DEST__", json.dumps(bus.get_unique_name())) + JS_WRAP % body)
+    fd, path = tempfile.mkstemp(suffix=".js", dir=runtime_dir())
+    os.write(fd, script.encode())
+    os.close(fd)
+    plugin = "kdedesktop_" + uuid.uuid4().hex[:10]
+    loaded = False
+    try:
+        try:
+            sid = bus.call_sync("org.kde.KWin", "/Scripting", "org.kde.kwin.Scripting", "loadScript",
+                                GLib.Variant("(ss)", (path, plugin)), GLib.VariantType("(i)"),
+                                Gio.DBusCallFlags.NONE, 3000, None).unpack()[0]
+        except Exception as exc:
+            log("error", "kwin", "loadScript failed", exc=True)
+            raise CliError("KWin scripting is unavailable over D-Bus", hint="is kwin_wayland running?",
+                           code=EXIT_ENV) from exc
+        if sid < 0:
+            log("error", "kwin", "loadScript returned negative id", plugin=plugin, sid=sid)
+            raise CliError("KWin refused to load the helper script")
+        loaded = True
+        for obj in (f"/Scripting/Script{sid}", f"/{sid}"):  # Plasma 6 path, then Plasma 5 path
+            try:
+                bus.call_sync("org.kde.KWin", obj, "org.kde.kwin.Script", "run", None, None,
+                              Gio.DBusCallFlags.NONE, 3000, None)
+                break
+            except Exception:
+                log("debug", "kwin", "script object path not found, trying next", path=obj)
+        else:
+            raise CliError("could not start the KWin helper script")
+        timer = GLib.timeout_add(int(timeout * 1000), lambda: (loop.quit(), False)[1])
+        loop.run()
+        if "raw" in result:
+            GLib.source_remove(timer)
+    finally:
+        if loaded:
+            try:
+                bus.call_sync("org.kde.KWin", "/Scripting", "org.kde.kwin.Scripting", "unloadScript",
+                              GLib.Variant("(s)", (plugin,)), None, Gio.DBusCallFlags.NONE, 3000, None)
+            except Exception:
+                log("warning", "kwin", "unloadScript failed; KWin drops it at session end", exc=True)
+        bus.unregister_object(reg_id)
+        os.unlink(path)
+    if "raw" not in result:
+        log("error", "kwin", "script produced no reply", timeout_s=timeout)
+        raise CliError(f"KWin helper did not answer within {timeout}s")
+    reply = json.loads(result["raw"])
+    log("debug", "kwin", "script finished", ms=int((time.monotonic() - t0) * 1000), ok=reply.get("ok"))
+    if not reply.get("ok"):
+        log("error", "kwin", "script raised", error=reply.get("error"), stack=reply.get("stack"))
+        if "window not found" in reply.get("error", ""):
+            raise CliError(reply["error"], hint="ids change when windows are recreated; run `win list`",
+                           code=EXIT_TARGET)
+        raise CliError(f"KWin script error: {reply.get('error')}")
+    return reply.get("value")
+
+
+def list_windows(include_all: bool = False) -> list[dict]:
+    return kwin_eval("return (ARGS.all ? workspace.windowList() : managed()).map(info);", {"all": include_all})
+
+
+def active_window() -> dict | None:
+    return kwin_eval("const w = workspace.activeWindow; return w ? info(w) : null;")
+
+
+def resolve_window(spec: str, windows: list[dict] | None = None) -> dict:
+    """Resolve 'active', a UUID, 'class:X', 'title:X', 'pid:N', or free text matched
+    case-insensitively against title and class (an exact class match wins)."""
+    windows = windows if windows is not None else list_windows()
+    spec = spec.strip()
+    if spec == "active":
+        hits = [w for w in windows if w["active"]]
+    elif re.fullmatch(r"\{?[0-9a-fA-F-]{36}\}?", spec):
+        hits = [w for w in windows if w["id"] == spec.strip("{}").lower()]
+    elif spec.startswith("pid:"):
+        hits = [w for w in windows if str(w["pid"]) == spec[4:]]
+    elif spec.startswith("class:"):
+        needle = spec[6:].casefold()
+        hits = [w for w in windows if needle in (w["class"] or "").casefold()]
+    elif spec.startswith("title:"):
+        needle = spec[6:].casefold()
+        hits = [w for w in windows if needle in (w["title"] or "").casefold()]
+    else:
+        needle = spec.casefold()
+        hits = [w for w in windows
+                if needle in (w["title"] or "").casefold() or needle in (w["class"] or "").casefold()]
+        hits = [w for w in hits if (w["class"] or "").casefold() == needle] or hits
+    if not hits:
+        log("info", "resolve", "no window matched", spec=spec)
+        raise CliError(f"no window matches {spec!r}", hint="run `kde-desktop win list`", code=EXIT_TARGET)
+    if len(hits) > 1:
+        log("info", "resolve", "ambiguous window spec", spec=spec, count=len(hits))
+        raise CliError(f"{len(hits)} windows match {spec!r}; pass an id", code=EXIT_TARGET,
+                       candidates=[{k: w[k] for k in ("id", "title", "class")} for w in hits])
+    return hits[0]
+
+
+def activate(win: dict, settle: float = 0.15) -> dict:
+    kwin_eval("""const w = byId(ARGS.id); if (w.minimized) w.minimized = false;
+                 workspace.activeWindow = w; return info(w);""", {"id": win["id"]})
+    deadline = time.monotonic() + 1.5
+    while time.monotonic() < deadline:
+        time.sleep(0.05)
+        current = active_window()
+        if current and current["id"] == win["id"]:
+            time.sleep(settle)
+            return current
+    log("warning", "win", "activation not confirmed", id=win["id"], title=win["title"])
+    raise CliError(f"could not activate {win['title']!r}", hint="a modal dialog or fullscreen app may hold focus")
+
+
+def cursor_pos() -> tuple[int, int]:
+    pos = kwin_eval("return [workspace.cursorPos.x, workspace.cursorPos.y];")
+    return int(pos[0]), int(pos[1])
+
+
+def screens() -> list[dict]:
+    return kwin_eval("return workspace.screens.map(s => ({name: s.name, geometry: geo(s.geometry)}));")
+
+
+def window_at(x: int, y: int, windows: list[dict] | None = None) -> dict | None:
+    """Topmost visible managed window containing the point (approximation via stacking order)."""
+    windows = windows if windows is not None else list_windows()
+    hits = [w for w in windows if not w["minimized"]
+            and w["frame"]["x"] <= x < w["frame"]["x"] + w["frame"]["w"]
+            and w["frame"]["y"] <= y < w["frame"]["y"] + w["frame"]["h"]]
+    return max(hits, key=lambda w: w["stacking"]) if hits else None
+
+
+# =========================================================================== window commands
+
+def cmd_win(a) -> None:
+    if a.action == "list":
+        emit_lines(list_windows(a.all))
+        return
+    if a.action == "active":
+        emit(active_window())
+        return
+    win = resolve_window(a.window)
+    if a.action == "get":
+        emit(win)
+        return
+    if a.action == "activate":
+        emit(activate(win))
+        return
+    ops = {
+        "close": "w.closeWindow();",
+        "minimize": "w.minimized = true;",
+        "unminimize": "w.minimized = false;",
+        "maximize": "w.setMaximize(true, true);",
+        "unmaximize": "w.setMaximize(false, false);",
+        "fullscreen": "w.fullScreen = ARGS.on;",
+        "above": "w.keepAbove = ARGS.on;",
+        "move": "const g = w.frameGeometry; w.frameGeometry = {x: ARGS.x, y: ARGS.y, width: g.width, height: g.height};",
+        "resize": "const g = w.frameGeometry; w.frameGeometry = {x: g.x, y: g.y, width: ARGS.w, height: ARGS.h};",
+        "place": "w.frameGeometry = {x: ARGS.x, y: ARGS.y, width: ARGS.w, height: ARGS.h};",
+        "to-desktop": """const d = workspace.desktops[ARGS.n - 1];
+                         if (!d) throw new Error("no desktop " + ARGS.n); w.desktops = [d];""",
+    }
+    args = {"id": win["id"]}
+    for key in ("x", "y", "w", "h", "n"):
+        if getattr(a, key, None) is not None:
+            args[key] = getattr(a, key)
+    if getattr(a, "state", None):
+        args["on"] = a.state == "on"
+    if a.action in ("close", "minimize") and win["pid"] in self_ancestor_pids() and not a.allow_self:
+        raise CliError(f"refusing to {a.action} the window hosting this terminal",
+                       hint="pass --allow-self if that is really intended", code=EXIT_SAFETY)
+    result = kwin_eval(f"const w = byId(ARGS.id); {ops[a.action]} return info(w);", args)
+    log("info", "win", f"window {a.action}", id=win["id"], title=win["title"])
+    if a.action == "close":
+        emit({"closed": win["id"], "title": win["title"]})
+        return
+    if a.action in ("move", "resize", "place", "maximize", "unmaximize", "fullscreen"):
+        # KWin applies geometry asynchronously; the value read inside the script is the old one.
+        time.sleep(0.15)
+        result = kwin_eval("return info(byId(ARGS.id));", {"id": win["id"]})
+    emit(result)
+
+
+def cmd_desk(a) -> None:
+    if a.action == "list":
+        emit(kwin_eval("""return {current: workspace.currentDesktop.x11DesktopNumber,
+            desktops: workspace.desktops.map(d => ({n: d.x11DesktopNumber, name: d.name}))};"""))
+    else:
+        emit(kwin_eval("""const d = workspace.desktops[ARGS.n - 1]; if (!d) throw new Error("no desktop " + ARGS.n);
+            workspace.currentDesktop = d; return {current: d.x11DesktopNumber, name: d.name};""", {"n": a.n}))
+
+
+def cmd_screens(_a) -> None:
+    emit({"screens": screens(), "cursor": list(cursor_pos())})
+
+
+# =========================================================================== screenshots and OCR
+
+def shots_dir() -> Path:
+    path = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "kde-desktop" / "shots"
+    path.mkdir(parents=True, exist_ok=True)
+    for stale in sorted(path.glob("*.png"), key=lambda p: p.stat().st_mtime)[:-40]:  # bounded cache
+        stale.unlink(missing_ok=True)
+    return path
+
+
+def image_size(path: Path) -> tuple[int, int]:
+    w, h = run(["magick", "identify", "-format", "%w %h", str(path)], ctx="image").stdout.split()
+    return int(w), int(h)
+
+
+def capture(a) -> tuple[Path, dict]:
+    """Capture the desktop and crop to the target. Returns the raw (physical-pixel) image and
+    the logical rectangle it covers. Cropping a full capture keeps geometry exact and needs no
+    interactive window pick."""
+    rect, label = None, "desktop"
+    if getattr(a, "window", None):
+        win = resolve_window(a.window)
+        if (not win["active"] or win["minimized"]) and not a.no_activate:
+            win = activate(win, settle=0.35)
+        f = win["frame"]
+        rect, label = (f["x"], f["y"], f["w"], f["h"]), win["title"]
+    elif getattr(a, "region", None):
+        rect, label = tuple(a.region), "region"
+    raw = runtime_dir() / f"raw-{TRACE_ID}.png"
+    run(["spectacle", "-b", "-n", "-f", "-o", str(raw)], timeout=20, ctx="shot")
+    if not raw.exists():
+        log("error", "shot", "spectacle produced no file", path=str(raw))
+        raise CliError("spectacle did not write a screenshot")
+    scr = screens()
+    min_x = min(s["geometry"]["x"] for s in scr)
+    min_y = min(s["geometry"]["y"] for s in scr)
+    max_x = max(s["geometry"]["x"] + s["geometry"]["w"] for s in scr)
+    max_y = max(s["geometry"]["y"] + s["geometry"]["h"] for s in scr)
+    raw_w, _ = image_size(raw)
+    k = raw_w / (max_x - min_x)  # physical pixels per logical pixel (fractional scaling)
+    logical = {"x": min_x, "y": min_y, "w": max_x - min_x, "h": max_y - min_y}
+    if rect:
+        x, y, w, h = rect
+        x0, y0 = max(x, min_x), max(y, min_y)
+        x1, y1 = min(x + w, max_x), min(y + h, max_y)
+        if x1 <= x0 or y1 <= y0:
+            raw.unlink(missing_ok=True)
+            raise CliError("target lies entirely off-screen", code=EXIT_TARGET)
+        crop = f"{round((x1 - x0) * k)}x{round((y1 - y0) * k)}+{round((x0 - min_x) * k)}+{round((y0 - min_y) * k)}"
+        run(["magick", str(raw), "-crop", crop, "+repage", str(raw)], ctx="shot")
+        logical = {"x": x0, "y": y0, "w": x1 - x0, "h": y1 - y0}
+    return raw, {"logical": logical, "k": k, "label": label}
+
+
+def cmd_shot(a) -> None:
+    raw, meta = capture(a)
+    out = Path(a.out).expanduser() if a.out else shots_dir() / f"shot-{datetime.now():%Y%m%d-%H%M%S}-{TRACE_ID[:4]}.png"
+    try:
+        run(["magick", str(raw), "-resize", f"{a.max_width}x{a.max_width}>", str(out)], ctx="shot")
+    finally:
+        raw.unlink(missing_ok=True)
+    w, h = image_size(out)
+    lg = meta["logical"]
+    scale = round(w / lg["w"], 5)
+    log("info", "shot", "screenshot saved", path=str(out), target=meta["label"], size=[w, h])
+    emit({"path": str(out), "width": w, "height": h, "target": meta["label"],
+          "covers": lg, "scale": scale,
+          "to_screen": f"screen_x = {lg['x']} + px / {scale}; screen_y = {lg['y']} + py / {scale}"})
+
+
+def tesseract_langs() -> list[str]:
+    out = run(["tesseract", "--list-langs"], ctx="ocr").stdout.splitlines()
+    return [line.strip() for line in out[1:] if line.strip()]  # first line is a header
+
+
+def ocr_lines(raw: Path, meta: dict, lang: str) -> list[dict]:
+    langs = tesseract_langs()
+    if lang not in langs:
+        log("error", "ocr", "tesseract language data missing", lang=lang, available=langs)
+        raise CliError(f"tesseract has no '{lang}' language data", hint=f"sudo pacman -S tesseract-data-{lang}",
+                       code=EXIT_ENV)
+    up = 2 if meta["k"] < 1.5 else 1  # screen text is small; upscaling roughly doubles OCR accuracy
+    work = raw
+    if up > 1:
+        work = raw.with_name(raw.stem + "-up.png")
+        run(["magick", str(raw), "-resize", f"{up * 100}%", str(work)], ctx="ocr")
+    tsv = run(["tesseract", str(work), "-", "-l", lang, "--psm", "11", "tsv"], timeout=60, ctx="ocr").stdout
+    if work != raw:
+        work.unlink(missing_ok=True)
+    f = meta["k"] * up
+    ox, oy = meta["logical"]["x"], meta["logical"]["y"]
+    groups: dict[tuple, list] = {}
+    for row in tsv.splitlines()[1:]:
+        cols = row.split("\t")
+        if len(cols) < 12 or not cols[11].strip() or float(cols[10]) < 0:
+            continue
+        left, top, width, height = (int(c) for c in cols[6:10])
+        groups.setdefault((cols[2], cols[3], cols[4]), []).append(
+            {"text": cols[11], "conf": float(cols[10]),
+             "x": ox + left / f, "y": oy + top / f, "w": width / f, "h": height / f})
+    lines = []
+    for words in groups.values():
+        lines.append({"text": " ".join(w["text"] for w in words), "words": words,
+                      "conf": round(sum(w["conf"] for w in words) / len(words))})
+    return lines
+
+
+def _box(words: list[dict]) -> dict:
+    x0 = min(w["x"] for w in words)
+    y0 = min(w["y"] for w in words)
+    x1 = max(w["x"] + w["w"] for w in words)
+    y1 = max(w["y"] + w["h"] for w in words)
+    return {"x": round(x0), "y": round(y0), "w": round(x1 - x0), "h": round(y1 - y0),
+            "center": [round((x0 + x1) / 2), round((y0 + y1) / 2)]}
+
+
+def cmd_ocr(a) -> None:
+    raw, meta = capture(a)
+    try:
+        lines = ocr_lines(raw, meta, a.lang)
+    finally:
+        raw.unlink(missing_ok=True)
+    if not a.find:
+        emit_lines({"text": ln["text"], "conf": ln["conf"], **_box(ln["words"])} for ln in lines)
+        return
+    needle, hits = a.find.casefold(), []
+    for ln in lines:
+        ws = ln["words"]
+        for i in range(len(ws)):  # smallest word span containing the needle, so the centre is clickable
+            for j in range(i, len(ws)):
+                if needle in " ".join(w["text"] for w in ws[i:j + 1]).casefold():
+                    hits.append({"match": " ".join(w["text"] for w in ws[i:j + 1]), "line": ln["text"],
+                                 "conf": ln["conf"], **_box(ws[i:j + 1])})
+                    break
+    if not hits:
+        log("info", "ocr", "text not found", needle_len=len(a.find))
+        raise CliError(f"text {a.find!r} not found on screen", hint="OCR misses small/low-contrast text; try a screenshot",
+                       code=EXIT_TARGET)
+    emit_lines(hits)
+
+
+# =========================================================================== accessibility (AT-SPI)
+
+_ATSPI = None
+BORING_ROLES = {"filler", "panel", "section", "grouping", "layered pane", "scroll pane", "viewport",
+                "unknown", "redundant object", "invalid", "split pane", "root pane", "glass pane"}
+SHOWN_STATES = ("focused", "selected", "checked", "pressed", "expanded", "collapsed", "editable", "modal",
+                "indeterminate")
+DEFAULT_ACTIONS = ("press", "click", "activate", "toggle", "jump", "open", "show menu", "expand or contract")
+
+
+def a11y_bus_address() -> str:
+    Gio, GLib = _gio()
+    bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+    return bus.call_sync("org.a11y.Bus", "/org/a11y/bus", "org.a11y.Bus", "GetAddress", None,
+                         GLib.VariantType("(s)"), Gio.DBusCallFlags.NONE, 3000, None).unpack()[0]
+
+
+def a11y_socket_ok(address: str) -> tuple[bool, str]:
+    m = re.search(r"unix:path=([^,;]+)", address)
+    if not m:
+        return True, "non-path address; not probed"
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(2)
+    try:
+        s.connect(m.group(1))
+        return True, m.group(1)
+    except OSError as exc:
+        return False, f"{m.group(1)}: {exc.strerror}"
+    finally:
+        s.close()
+
+
+def a11y_enabled(set_to: bool | None = None) -> bool:
+    Gio, GLib = _gio()
+    bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+    if set_to is not None:
+        bus.call_sync("org.a11y.Bus", "/org/a11y/bus", "org.freedesktop.DBus.Properties", "Set",
+                      GLib.Variant("(ssv)", ("org.a11y.Status", "IsEnabled", GLib.Variant("b", set_to))),
+                      None, Gio.DBusCallFlags.NONE, 3000, None)
+    return bus.call_sync("org.a11y.Bus", "/org/a11y/bus", "org.freedesktop.DBus.Properties", "Get",
+                         GLib.Variant("(ss)", ("org.a11y.Status", "IsEnabled")), GLib.VariantType("(v)"),
+                         Gio.DBusCallFlags.NONE, 3000, None).unpack()[0]
+
+
+def atspi():
+    """Import AT-SPI only after proving the bus is reachable: libatspi aborts the whole
+    process (g_error) when it cannot connect, which would bypass all error reporting."""
+    global _ATSPI
+    if _ATSPI:
+        return _ATSPI
+    try:
+        address = a11y_bus_address()
+    except Exception as exc:
+        log("error", "a11y", "org.a11y.Bus unavailable", exc=True)
+        raise CliError("accessibility bus service is not running", hint="kde-desktop doctor --fix", code=EXIT_ENV) from exc
+    ok, detail = a11y_socket_ok(address)
+    if not ok:
+        log("error", "a11y", "accessibility bus socket refused", detail=detail)
+        raise CliError(f"accessibility bus socket is stale ({detail})", hint="kde-desktop doctor --fix", code=EXIT_ENV)
+    if not a11y_enabled():
+        log("warning", "a11y", "accessibility disabled; enabling and waiting for apps to register")
+        a11y_enabled(True)
+        time.sleep(1.0)
+    import gi
+    gi.require_version("Atspi", "2.0")
+    from gi.repository import Atspi, GLib
+    try:  # route libatspi warnings (e.g. apps with stale peer sockets) to the log instead of stderr
+        GLib.log_set_handler("atspi", GLib.LogLevelFlags.LEVEL_WARNING | GLib.LogLevelFlags.LEVEL_MESSAGE,
+                             lambda dom, lvl, msg, *_: log("debug", "a11y", "libatspi: " + msg), None)
+    except Exception:
+        log("debug", "a11y", "could not install libatspi log handler")
+    Atspi.set_timeout(1500, 15000)
+    _ATSPI = Atspi
+    return Atspi
+
+
+def a11y_apps() -> list:
+    Atspi = atspi()
+    desk = Atspi.get_desktop(0)
+    apps = []
+    for i in range(desk.get_child_count()):
+        try:
+            app = desk.get_child_at_index(i)
+            if app is not None:
+                apps.append(app)
+        except Exception:
+            log("debug", "a11y", "skipping unreachable application", index=i)
+    return apps
+
+
+def _safe(fn, default=None):
+    try:
+        return fn()
+    except Exception:
+        return default
+
+
+class Scope:
+    """An accessibility subtree plus the offset converting its extents to screen coordinates."""
+
+    def __init__(self, app, frames: list[tuple[int, object, tuple[int, int] | None]]):
+        self.app, self.frames = app, frames
+
+
+def _frame_offset(Atspi, frame, win: dict | None) -> tuple[int, int] | None:
+    """Wayland clients do not know their global position, so toolkits report extents relative
+    to the window. Offset = KWin client origin - frame's self-reported origin; this also
+    yields (0,0) for X11 apps that already report true screen coordinates."""
+    if not win:
+        return None
+    ext = _safe(lambda: frame.get_component_iface().get_extents(Atspi.CoordType.SCREEN))
+    if ext is None:
+        return (win["client"]["x"], win["client"]["y"])
+    return (win["client"]["x"] - ext.x, win["client"]["y"] - ext.y)
+
+
+def _match_frame_window(frame_name: str, wins: list[dict]) -> dict | None:
+    if len(wins) == 1:
+        return wins[0]
+    name = (frame_name or "").casefold()
+    for test in (lambda t: t == name, lambda t: name and name in t, lambda t: t and t in name):
+        hits = [w for w in wins if test((w["title"] or "").casefold())]
+        if len(hits) == 1:
+            return hits[0]
+    return None
+
+
+def resolve_scope(a) -> Scope:
+    Atspi = atspi()
+    windows = list_windows()
+    if getattr(a, "window", None):
+        win = resolve_window(a.window, windows)
+        apps = [app for app in a11y_apps() if pid_related(_safe(app.get_process_id, -1), win["pid"])]
+        if not apps:
+            log("info", "a11y", "window has no accessibility tree", pid=win["pid"], cls=win["class"])
+            raise CliError(f"{win['class']} exposes no accessibility tree", code=EXIT_TARGET,
+                           hint="Chromium/Electron need --force-renderer-accessibility; apps started before "
+                                "accessibility was enabled need a restart; otherwise use `ocr`/`shot`")
+        title = (win["title"] or "").casefold()
+
+        def score(fr) -> int:
+            name = (_safe(fr.get_name, "") or "").casefold()
+            return 3 if name == title else 2 if name and name in title else 1 if name and title in name else 0
+
+        candidates = []  # (score, app, index, frame)
+        for app in apps:
+            for i in range(_safe(app.get_child_count, 0) or 0):
+                fr = _safe(lambda: app.get_child_at_index(i))
+                if fr is not None:
+                    candidates.append((score(fr), app, i, fr))
+        if not candidates:
+            raise CliError("accessibility tree found but it has no frames", code=EXIT_TARGET)
+        best = max(c[0] for c in candidates)
+        if best == 0 and len(candidates) > 1:
+            log("warning", "a11y", "no frame title matches the window; scoping to all frames", title=win["title"])
+        chosen = [c for c in candidates if c[0] == best]
+        app = chosen[0][1]
+        return Scope(app, [(i, fr, _frame_offset(Atspi, fr, win)) for _s, ap, i, fr in chosen if ap is app])
+    if getattr(a, "app", None):
+        key = a.app.casefold()
+        apps = [app for app in a11y_apps()
+                if (_safe(app.get_name, "") or "").casefold() == key or str(_safe(app.get_process_id)) == key]
+        if not apps:
+            raise CliError(f"no accessible application named {a.app!r}", hint="run `kde-desktop a11y apps`",
+                           code=EXIT_TARGET)
+        if len(apps) > 1:
+            raise CliError(f"{len(apps)} applications named {a.app!r}; pass --app <pid>", code=EXIT_TARGET,
+                           candidates=[{"pid": _safe(x.get_process_id)} for x in apps])
+        app = apps[0]
+        pid = _safe(app.get_process_id, -1)
+        wins = [w for w in windows if pid_related(pid, w["pid"])]
+        frames = []
+        for i in range(_safe(app.get_child_count, 0)):
+            fr = _safe(lambda: app.get_child_at_index(i))
+            if fr is not None:
+                frames.append((i, fr, _frame_offset(Atspi, fr, _match_frame_window(_safe(fr.get_name, ""), wins))))
+        return Scope(app, frames)
+    raise CliError("pass --window WIN or --app NAME", code=EXIT_USAGE)
+
+
+def walk(scope: Scope, include_hidden: bool, max_visit: int, root_path: str | None = None):
+    """Depth-first (node, path, depth, offset). Hidden subtrees are pruned: an unshown container's
+    children are not on screen either, and pruning keeps large apps fast."""
+    Atspi = atspi()
+    visited = 0
+    stack = []
+    for idx, fr, off in reversed(scope.frames):
+        stack.append((fr, (idx,), 0, off))
+    if root_path:
+        want = tuple(int(p) for p in root_path.split("."))
+        node, off = None, None
+        for idx, fr, o in scope.frames:
+            if idx == want[0]:
+                node, off = fr, o
+        for k in want[1:]:
+            node = _safe(lambda: node.get_child_at_index(k)) if node is not None else None
+        if node is None:
+            raise CliError(f"no node at path {root_path}", hint="paths shift when the UI changes; re-run `a11y find`",
+                           code=EXIT_TARGET)
+        stack = [(node, want, 0, off)]
+    while stack and visited < max_visit:
+        node, path, depth, off = stack.pop()
+        visited += 1
+        states = _safe(lambda: node.get_state_set(), None)
+        showing = states.contains(Atspi.StateType.SHOWING) if states else False
+        if not include_hidden and not showing and depth > 0:
+            continue
+        yield node, path, depth, off
+        n = _safe(node.get_child_count, 0) or 0
+        for k in reversed(range(min(n, 500))):
+            child = _safe(lambda: node.get_child_at_index(k))
+            if child is not None:
+                stack.append((child, path + (k,), depth + 1, off))
+    if stack:
+        log("warning", "a11y", "walk truncated", max_visit=max_visit, pending=len(stack))
+
+
+def node_info(node, path, off, text_chars: int = 120) -> dict:
+    Atspi = atspi()
+    d = {"path": ".".join(map(str, path)), "role": _safe(node.get_role_name, "?"), "name": _safe(node.get_name, "") or ""}
+    states = _safe(lambda: [s.value_nick.replace("-", " ") for s in node.get_state_set().get_states()], []) or []
+    d["states"] = [s for s in states if s in SHOWN_STATES] + ([] if "enabled" in states else ["disabled"])
+    ai = _safe(node.get_action_iface)
+    if ai:
+        d["actions"] = [Atspi.Action.get_action_name(ai, i) for i in range(_safe(ai.get_n_actions, 0))]
+    ti = _safe(node.get_text_iface)
+    if ti:
+        count = _safe(lambda: Atspi.Text.get_character_count(ti), 0)
+        if count:
+            txt = _safe(lambda: Atspi.Text.get_text(ti, 0, min(count, text_chars)), "")
+            if txt and txt != d["name"]:
+                d["text"] = txt + ("…" if count > text_chars else "")
+    vi = _safe(node.get_value_iface)
+    if vi:
+        d["value"] = _safe(lambda: Atspi.Value.get_current_value(vi))
+    ci = _safe(node.get_component_iface)
+    if ci:
+        e = _safe(lambda: ci.get_extents(Atspi.CoordType.SCREEN))
+        if e and e.width > 0 and e.height > 0:
+            if off is not None:
+                x, y = e.x + off[0], e.y + off[1]
+                d["box"] = [x, y, e.width, e.height]
+                d["center"] = [x + e.width // 2, y + e.height // 2]
+            else:
+                d["box_window_relative"] = [e.x, e.y, e.width, e.height]
+    return d
+
+
+ROLE_ALIASES = {"push button": "button", "pushbutton": "button", "entry": "text", "textbox": "text",
+                "checkbox": "check box", "radiobutton": "radio button", "menuitem": "menu item"}
+
+
+def _norm_role(r: str) -> str:
+    """Toolkits disagree on role names (Qt 6 says "button", GTK/Qt 5 "push button"), so compare
+    canonical forms."""
+    r = r.casefold().replace("_", " ").replace("-", " ").strip()
+    return ROLE_ALIASES.get(r, ROLE_ALIASES.get(r.replace(" ", ""), r))
+
+
+def find_nodes(scope: Scope, a, limit: int) -> list[tuple]:
+    role = _norm_role(a.role) if a.role else None
+    name = a.name.casefold() if a.name else None
+    out = []
+    for node, path, depth, off in walk(scope, a.hidden, a.max_visit, getattr(a, "under", None)):
+        if role and _norm_role(_safe(node.get_role_name, "")) != role:
+            continue
+        nm = (_safe(node.get_name, "") or "")
+        if name is not None:
+            if a.exact and nm.casefold() != name:
+                continue
+            if not a.exact and name not in nm.casefold():
+                ti = _safe(node.get_text_iface)
+                txt = (_safe(lambda: atspi().Text.get_text(ti, 0, 400), "") or "") if ti else ""
+                if name not in txt.casefold():
+                    continue
+        if a.action_filter:
+            ai = _safe(node.get_action_iface)
+            names = [re.sub(r"[\s_-]", "", atspi().Action.get_action_name(ai, i)).casefold()
+                     for i in range(ai.get_n_actions())] if ai else []
+            if re.sub(r"[\s_-]", "", a.action_filter).casefold() not in names:
+                continue
+        out.append((node, path, off))
+        if len(out) >= limit:
+            break
+    return out
+
+
+def pick_node(scope: Scope, a) -> tuple:
+    if a.path:
+        for node, path, _depth, off in walk(scope, True, 1, a.path):
+            return node, path, off
+    if not (a.role or a.name):
+        raise CliError("select a node with --path, or --role/--name", code=EXIT_USAGE)
+    hits = find_nodes(scope, a, limit=50)
+    if not hits:
+        raise CliError("no accessible node matches", hint="inspect with `a11y tree`; try --hidden or a looser --name",
+                       code=EXIT_TARGET)
+    if a.nth is not None:
+        if a.nth >= len(hits):
+            raise CliError(f"--nth {a.nth} out of range ({len(hits)} matches)", code=EXIT_TARGET)
+        return hits[a.nth]
+    if len(hits) > 1:
+        raise CliError(f"{len(hits)} nodes match; refine or pass --nth/--path", code=EXIT_TARGET,
+                       candidates=[node_info(n, p, o, 40) for n, p, o in hits[:12]])
+    return hits[0]
+
+
+def outline_line(d: dict, indent: int) -> str:
+    parts = [f"{'  ' * indent}[{d['path']}] {d['role']}"]
+    if d["name"]:
+        parts.append(json.dumps(d["name"], ensure_ascii=False))
+    if "text" in d:
+        parts.append("text=" + json.dumps(d["text"], ensure_ascii=False))
+    if d.get("value") is not None:
+        parts.append(f"value={d['value']:g}")
+    if d["states"]:
+        parts.append("(" + ",".join(d["states"]) + ")")
+    if "box" in d:
+        x, y, w, h = d["box"]
+        parts.append(f"@{x},{y} {w}x{h}")
+    elif "box_window_relative" in d:
+        x, y, w, h = d["box_window_relative"]
+        parts.append(f"@win+{x},{y} {w}x{h}")
+    acts = list(dict.fromkeys(x for x in d.get("actions", []) if x.replace(" ", "").casefold() != "setfocus"))
+    if acts:
+        parts.append("{" + ",".join(acts) + "}")
+    return " ".join(parts)
+
+
+def cmd_a11y(a) -> None:
+    if a.action == "apps":
+        out = []
+        for app in a11y_apps():
+            out.append({"name": _safe(app.get_name, ""), "pid": _safe(app.get_process_id),
+                        "toolkit": _safe(app.get_toolkit_name, ""), "frames": _safe(app.get_child_count, 0)})
+        emit_lines(out)
+        return
+    scope = resolve_scope(a)
+    if a.action == "tree":
+        printed, lines, ancestors = 0, [], []  # ancestors: paths of printed nodes enclosing the current one
+        for node, path, depth, off in walk(scope, a.hidden, a.max_visit, a.under):
+            if a.depth is not None and depth > a.depth:
+                continue
+            d = node_info(node, path, off)
+            actions = [x for x in d.get("actions", []) if x.replace(" ", "").casefold() != "setfocus"]
+            boring = d["role"] in BORING_ROLES and not d["name"] and "text" not in d and not actions
+            if boring and depth > 0:
+                continue  # layout containers add depth but no information; their children stay visible
+            while ancestors and path[:len(ancestors[-1])] != ancestors[-1]:
+                ancestors.pop()
+            lines.append(outline_line(d, len(ancestors)))
+            ancestors.append(path)
+            printed += 1
+            if printed >= a.max:
+                lines.append(f"… truncated at {a.max} nodes; narrow with --under PATH or --depth N")
+                break
+        sys.stdout.write("\n".join(lines) + "\n")
+        return
+    if a.action == "find":
+        hits = find_nodes(scope, a, a.max)
+        if not hits:
+            raise CliError("no accessible node matches", hint="loosen --name, drop --role, add --hidden, or read `a11y tree`",
+                           code=EXIT_TARGET)
+        emit_lines(node_info(n, p, o) for n, p, o in hits)
+        return
+    node, path, off = pick_node(scope, a)
+    Atspi = atspi()
+    info = node_info(node, path, off, text_chars=200)
+    if a.action == "do":
+        ai = _safe(node.get_action_iface)
+        names = [Atspi.Action.get_action_name(ai, i) for i in range(ai.get_n_actions())] if ai else []
+        if not names:
+            raise CliError(f"node {info['path']} ({info['role']}) has no actions", code=EXIT_TARGET,
+                           hint="click its center with `input click --at` instead")
+        def norm(x: str) -> str:  # toolkits differ: "Show Menu" vs "showMenu" vs "show-menu"
+            return re.sub(r"[\s_-]", "", x).casefold()
+        want = [a.do_action] if a.do_action else list(DEFAULT_ACTIONS)
+        idx = next((i for w in want for i, n in enumerate(names) if norm(n) == norm(w)), None)
+        if idx is None:
+            raise CliError(f"action not available; node offers {names}", code=EXIT_TARGET)
+        try:
+            ok = Atspi.Action.do_action(ai, idx)
+        except Exception as exc:
+            if "did not receive a reply" not in str(exc).casefold():
+                raise
+            # Qt runs a modal dialog's event loop inside the action handler, so the reply only
+            # arrives after the dialog closes. The action has been dispatched.
+            log("warning", "a11y", "action sent but app did not reply (modal dialog likely opened)",
+                action=names[idx], role=info["role"])
+            emit({"did": names[idx], "ok": True, "node": info,
+                  "note": "no reply: the app is busy, usually because a modal dialog opened; run `win list`"})
+            return
+        log("info", "a11y", "action performed", action=names[idx], role=info["role"], ok=ok)
+        emit({"did": names[idx], "ok": bool(ok), "node": info})
+    elif a.action == "text":
+        ti = _safe(node.get_text_iface)
+        if not ti:
+            emit({"text": info["name"], "source": "name", "node": info["path"]})
+            return
+        count = Atspi.Text.get_character_count(ti)
+        emit({"text": Atspi.Text.get_text(ti, 0, min(count, a.max_chars)), "length": count, "node": info["path"]})
+    elif a.action == "set-text":
+        ei = _safe(node.get_editable_text_iface)
+        if not ei:
+            raise CliError(f"node {info['path']} ({info['role']}) is not editable", code=EXIT_TARGET,
+                           hint="focus it and use `input type --window ...`")
+        ti = node.get_text_iface()
+        if a.append:
+            ok = Atspi.EditableText.insert_text(ei, Atspi.Text.get_character_count(ti), a.value, len(a.value.encode()))
+        else:
+            ok = Atspi.EditableText.set_text_contents(ei, a.value)
+        now = Atspi.Text.get_text(ti, 0, Atspi.Text.get_character_count(ti))
+        verified = now.endswith(a.value) if a.append else now == a.value
+        log("info" if verified else "warning", "a11y", "set-text", ok=ok, verified=verified, **fingerprint(a.value))
+        emit({"ok": bool(ok), "verified": verified, "node": info["path"]})
+    elif a.action == "focus":
+        ci = _safe(node.get_component_iface)
+        ok = bool(ci and Atspi.Component.grab_focus(ci))
+        emit({"ok": ok, "node": info})
+    elif a.action == "value":
+        vi = _safe(node.get_value_iface)
+        if not vi:
+            raise CliError(f"node {info['path']} has no value interface", code=EXIT_TARGET)
+        if a.set is not None:
+            Atspi.Value.set_current_value(vi, a.set)
+        emit({"value": Atspi.Value.get_current_value(vi), "min": Atspi.Value.get_minimum_value(vi),
+              "max": Atspi.Value.get_maximum_value(vi), "node": info["path"]})
+    elif a.action == "info":
+        emit(info)
+
+
+# =========================================================================== input (ydotool)
+
+KEYCODES = {
+    "esc": 1, "escape": 1, "1": 2, "2": 3, "3": 4, "4": 5, "5": 6, "6": 7, "7": 8, "8": 9, "9": 10, "0": 11,
+    "minus": 12, "-": 12, "equal": 13, "=": 13, "backspace": 14, "tab": 15,
+    "q": 16, "w": 17, "e": 18, "r": 19, "t": 20, "y": 21, "u": 22, "i": 23, "o": 24, "p": 25,
+    "bracketleft": 26, "[": 26, "bracketright": 27, "]": 27, "enter": 28, "return": 28,
+    "ctrl": 29, "control": 29, "a": 30, "s": 31, "d": 32, "f": 33, "g": 34, "h": 35, "j": 36, "k": 37, "l": 38,
+    "semicolon": 39, ";": 39, "apostrophe": 40, "quote": 40, "'": 40, "grave": 41, "backtick": 41, "`": 41,
+    "shift": 42, "backslash": 43, "\\": 43, "z": 44, "x": 45, "c": 46, "v": 47, "b": 48, "n": 49, "m": 50,
+    "comma": 51, ",": 51, "period": 52, "dot": 52, ".": 52, "slash": 53, "/": 53, "rightshift": 54,
+    "alt": 56, "space": 57, "capslock": 58,
+    "f1": 59, "f2": 60, "f3": 61, "f4": 62, "f5": 63, "f6": 64, "f7": 65, "f8": 66, "f9": 67, "f10": 68,
+    "f11": 87, "f12": 88, "rightctrl": 97, "print": 99, "sysrq": 99, "altgr": 100, "rightalt": 100,
+    "home": 102, "up": 103, "pageup": 104, "pgup": 104, "left": 105, "right": 106, "end": 107, "down": 108,
+    "pagedown": 109, "pgdn": 109, "insert": 110, "delete": 111, "del": 111,
+    "mute": 113, "volumedown": 114, "volumeup": 115, "pause": 119,
+    "super": 125, "meta": 125, "win": 125, "menu": 127, "compose": 127,
+    "next": 163, "nextsong": 163, "playpause": 164, "prev": 165, "previous": 165, "previoussong": 165,
+}
+MODIFIERS = {"ctrl", "control", "shift", "alt", "altgr", "super", "meta", "win", "rightctrl", "rightshift", "rightalt"}
+BUTTONS = {"left": 0x00, "right": 0x01, "middle": 0x02}
+
+
+def ydotool_socket() -> str:
+    return os.environ.get("YDOTOOL_SOCKET") or f"{os.environ['XDG_RUNTIME_DIR']}/.ydotool_socket"
+
+
+def _socket_alive(path: str) -> bool:
+    if not os.path.exists(path):
+        return False
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+    try:
+        s.connect(path)
+        return True
+    except OSError:
+        return False
+    finally:
+        s.close()
+
+
+def uinput_status() -> tuple[bool, str]:
+    if Path("/sys/devices/virtual/misc/uinput").exists():
+        if os.access("/dev/uinput", os.R_OK | os.W_OK):
+            return True, "uinput available and writable"
+        return False, "no write access to /dev/uinput (needs a logind uaccess ACL or the input group)"
+    if not Path(f"/usr/lib/modules/{os.uname().release}").exists():
+        return False, (f"running kernel {os.uname().release} has no modules on disk (kernel upgraded "
+                       "without a reboot); reboot to load uinput")
+    return False, "uinput module not loaded: sudo modprobe uinput"
+
+
+def ensure_ydotool() -> dict:
+    if not shutil.which("ydotool"):
+        raise CliError("ydotool is not installed", hint=INSTALL_HINTS["ydotool"], code=EXIT_ENV)
+    sock = ydotool_socket()
+    if _socket_alive(sock):
+        return {"YDOTOOL_SOCKET": sock}
+    ok, why = uinput_status()
+    if not ok:
+        log("error", "input", "uinput unavailable", reason=why)
+        raise CliError(f"keyboard/pointer injection unavailable: {why}", code=EXIT_ENV,
+                       hint="meanwhile use `a11y do` / `a11y set-text`, which need no input injection")
+    log("warning", "input", "ydotoold not running; starting user service")
+    run(["systemctl", "--user", "start", "ydotool.service"], ctx="input", check=False)
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline:
+        if _socket_alive(sock):
+            log("info", "input", "ydotoold is up", socket=sock)
+            return {"YDOTOOL_SOCKET": sock}
+        time.sleep(0.1)
+    tail = run(["journalctl", "--user", "-u", "ydotool", "-n", "5", "--no-pager", "-o", "cat"], check=False).stdout
+    log("error", "input", "ydotoold failed to start", journal=tail)
+    raise CliError("ydotoold did not start", hint=f"journal: {tail.strip()[-300:]}", code=EXIT_ENV)
+
+
+def guard_target(a, point: tuple[int, int] | None = None) -> dict | None:
+    """Pick and verify the window that will receive synthetic input.
+
+    Synthetic input goes wherever focus (or the pointer) is, which is easy to get wrong. Requiring an
+    explicit target, activating it, and refusing the terminal running this CLI stops an agent from
+    typing commands into its own shell.
+    """
+    selfp = self_ancestor_pids()
+    windows = list_windows()
+    if a.window:
+        win = resolve_window(a.window, windows)
+        if win["pid"] in selfp and not a.allow_self:
+            raise CliError("target is the terminal running this CLI", hint="pass --allow-self only if intended",
+                           code=EXIT_SAFETY)
+        win = activate(win)
+    elif a.focused:
+        win = active_window()
+        if win and win["pid"] in selfp and not a.allow_self:
+            raise CliError("the focused window is the terminal running this CLI; pass --window",
+                           code=EXIT_SAFETY)
+    elif getattr(a, "anywhere", False):
+        win = None
+    else:
+        raise CliError("say where input goes: --window WIN (activates it) or --focused", code=EXIT_USAGE)
+    if point is not None:
+        under = window_at(point[0], point[1], list_windows())
+        if under and under["pid"] in selfp and not a.allow_self:
+            raise CliError(f"point {point} is over the terminal running this CLI", code=EXIT_SAFETY)
+        if win and (not under or under["id"] != win["id"]):
+            raise CliError(f"point {point} is not inside {win['title']!r}",
+                           hint="coordinates are global screen pixels; check `win get` frame", code=EXIT_TARGET,
+                           under=under and {"id": under["id"], "title": under["title"]})
+    return win
+
+
+def key_args(spec: str) -> list[str]:
+    parts = [p.strip().casefold() for p in spec.split("+") if p.strip()]
+    if not parts:
+        raise CliError(f"empty key spec {spec!r}", code=EXIT_USAGE)
+    codes = []
+    for p in parts:
+        if p not in KEYCODES:
+            raise CliError(f"unknown key {p!r}", hint="names: ctrl shift alt super enter esc tab space f1..f12 "
+                                                      "up down left right home end pageup pagedown delete a-z 0-9",
+                           code=EXIT_USAGE)
+        codes.append(KEYCODES[p])
+    mods, key = codes[:-1], codes[-1]
+    return [f"{c}:1" for c in mods] + [f"{key}:1", f"{key}:0"] + [f"{c}:0" for c in reversed(mods)]
+
+
+def move_pointer(x: int, y: int, env: dict) -> tuple[int, int]:
+    """Converge on (x, y) with relative moves checked against KWin's cursor position.
+
+    A uinput mouse only reports relative motion, which libinput then accelerates, so a single
+    computed jump lands in the wrong place; closing the loop on the real position is reliable."""
+    cur = cursor_pos()
+    for attempt in range(8):
+        dx, dy = x - cur[0], y - cur[1]
+        if abs(dx) <= 1 and abs(dy) <= 1:
+            return cur
+        run(["ydotool", "mousemove", "-x", str(dx), "-y", str(dy)], env=env, ctx="input")
+        time.sleep(0.04)
+        cur = cursor_pos()
+        log("debug", "input", "pointer step", attempt=attempt, target=[x, y], now=list(cur))
+    log("warning", "input", "pointer did not converge", target=[x, y], now=list(cur))
+    raise CliError(f"pointer stopped at {cur}, not {(x, y)}", hint="kde-desktop doctor --fix (flat acceleration)")
+
+
+def cmd_input(a) -> None:
+    env = ensure_ydotool()
+    if a.action == "move":
+        cur = move_pointer(a.x, a.y, env)
+        emit({"cursor": list(cur)})
+        return
+    if a.action in ("click", "scroll"):
+        point = tuple(a.at) if a.at else None
+        win = guard_target(a, point or cursor_pos())
+        if point:
+            move_pointer(point[0], point[1], env)
+        if a.action == "click":
+            code = hex(0xC0 | BUTTONS[a.button])
+            run(["ydotool", "click", "-r", str(2 if a.double else 1), "-D", "60", code], env=env, ctx="input")
+        else:
+            run(["ydotool", "mousemove", "-w", "-x", "0", "-y", str(a.amount)], env=env, ctx="input")
+        log("info", "input", a.action, at=point, window=win and win["title"])
+        emit({"did": a.action, "at": list(point or cursor_pos()), "window": win and win["title"]})
+        return
+    win = guard_target(a)
+    if a.action == "key":
+        for spec in a.keys:
+            run(["ydotool", "key", "-d", "20", *key_args(spec)], env=env, ctx="input")
+            time.sleep(0.03)
+        log("info", "input", "keys sent", keys=a.keys, window=win and win["title"])
+        emit({"did": "key", "keys": a.keys, "window": win and win["title"]})
+    elif a.action == "type":
+        bad = sorted({c for c in a.text if not (c.isascii() and (c.isprintable() or c in "\n\t"))})
+        if bad:
+            raise CliError(f"ydotool types US-keyboard ASCII only; got {bad[:5]}",
+                           hint="use `input paste` for Unicode text", code=EXIT_USAGE)
+        run(["ydotool", "type", "-d", str(a.delay), "--", a.text], env=env, ctx="input", redact=True, timeout=120)
+        log("info", "input", "text typed", window=win and win["title"], **fingerprint(a.text))
+        emit({"did": "type", "chars": len(a.text), "window": win and win["title"]})
+    elif a.action == "paste":
+        previous = clipboard_text()
+        run(["wl-copy", "--", a.text], ctx="input", redact=True)
+        time.sleep(0.05)
+        run(["ydotool", "key", "-d", "20", *key_args("ctrl+shift+v" if a.terminal else "ctrl+v")], env=env, ctx="input")
+        time.sleep(0.3)  # let the target read the offer before the clipboard is restored
+        if previous is None:
+            run(["wl-copy", "--clear"], ctx="input", check=False)
+        else:
+            run(["wl-copy", "--", previous], ctx="input", redact=True, check=False)
+        log("info", "input", "text pasted", window=win and win["title"], restored=previous is not None,
+            **fingerprint(a.text))
+        emit({"did": "paste", "chars": len(a.text), "window": win and win["title"]})
+
+
+# =========================================================================== apps
+
+def desktop_dirs() -> list[Path]:
+    home = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share"))
+    dirs = [home / "applications"]
+    for d in os.environ.get("XDG_DATA_DIRS", "/usr/local/share:/usr/share").split(":"):
+        dirs.append(Path(d) / "applications")
+    dirs += [home / "flatpak/exports/share/applications", Path("/var/lib/flatpak/exports/share/applications")]
+    seen, out = set(), []
+    for d in dirs:
+        if d.is_dir() and d.resolve() not in seen:
+            seen.add(d.resolve())
+            out.append(d)
+    return out
+
+
+def desktop_entries(include_hidden: bool = False) -> list[dict]:
+    entries: dict[str, dict] = {}
+    for base in desktop_dirs():
+        for f in base.rglob("*.desktop"):
+            did = str(f.relative_to(base)).replace("/", "-")[:-len(".desktop")]
+            if did in entries:  # earlier directories override later ones (XDG precedence)
+                continue
+            fields, in_main = {}, False
+            try:
+                for line in f.read_text(errors="replace").splitlines():
+                    if line.startswith("["):
+                        in_main = line.strip() == "[Desktop Entry]"
+                    elif in_main and "=" in line and not line.startswith("#"):
+                        k, v = line.split("=", 1)
+                        fields.setdefault(k.strip(), v.strip())
+            except OSError:
+                log("warning", "app", "unreadable desktop file", path=str(f))
+                continue
+            entries[did] = {"id": did, "name": fields.get("Name", did), "generic": fields.get("GenericName"),
+                            "keywords": fields.get("Keywords"), "wm_class": fields.get("StartupWMClass"),
+                            "hidden": fields.get("NoDisplay") == "true" or fields.get("Hidden") == "true"
+                            or fields.get("Type", "Application") != "Application"}
+    return [e for e in entries.values() if include_hidden or not e["hidden"]]
+
+
+def resolve_app(query: str) -> dict:
+    entries = desktop_entries(include_hidden=True)
+    q = query.casefold().removesuffix(".desktop")
+    for test in (lambda e: e["id"].casefold() == q,
+                 lambda e: e["name"].casefold() == q and not e["hidden"],
+                 lambda e: e["id"].casefold().rsplit(".", 1)[-1] == q and not e["hidden"]):
+        hits = [e for e in entries if test(e)]
+        if len(hits) == 1:
+            return hits[0]
+    hits = [e for e in entries if not e["hidden"] and
+            (q in e["id"].casefold() or q in e["name"].casefold() or q in (e["generic"] or "").casefold())]
+    if len(hits) == 1:
+        return hits[0]
+    if not hits:
+        raise CliError(f"no application matches {query!r}", hint="kde-desktop app list QUERY", code=EXIT_TARGET)
+    raise CliError(f"{len(hits)} applications match {query!r}", code=EXIT_TARGET,
+                   candidates=[{"id": e["id"], "name": e["name"]} for e in hits[:15]])
+
+
+def cmd_app(a) -> None:
+    if a.action == "list":
+        q = (a.query or "").casefold()
+        emit_lines({k: e[k] for k in ("id", "name", "generic")} for e in sorted(desktop_entries(a.all), key=lambda e: e["id"])
+                   if not q or any(q in (e[k] or "").casefold() for k in ("id", "name", "generic", "keywords")))
+        return
+    entry = resolve_app(a.query)
+    before = {w["id"] for w in list_windows()} if a.wait else set()
+    cmd = ["kstart", "--application", entry["id"]] + (["--url", a.url] if a.url else [])
+    try:
+        subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         start_new_session=True)
+    except FileNotFoundError as exc:
+        log("error", "app", "kstart missing", exc=True)
+        raise CliError("kstart is not installed", hint=INSTALL_HINTS["kstart"], code=EXIT_ENV) from exc
+    log("info", "app", "launched", id=entry["id"], url=bool(a.url))
+    if not a.wait:
+        emit({"launched": entry["id"], "name": entry["name"]})
+        return
+    keys = {entry["id"].casefold(), entry["id"].casefold().rsplit(".", 1)[-1], (entry["wm_class"] or "").casefold()}
+    deadline = time.monotonic() + a.wait
+    while time.monotonic() < deadline:
+        time.sleep(0.2)
+        new = [w for w in list_windows() if w["id"] not in before]
+        match = [w for w in new if (w["class"] or "").casefold() in keys
+                 or (w["class"] or "").casefold().rsplit(".", 1)[-1] in keys
+                 or entry["name"].casefold() in (w["title"] or "").casefold()]
+        if match:
+            emit({"launched": entry["id"], "window": match[0]})
+            return
+    new = [w for w in list_windows() if w["id"] not in before]
+    if len(new) == 1:
+        log("warning", "app", "window matched only as the single new window", id=entry["id"], cls=new[0]["class"])
+        emit({"launched": entry["id"], "window": new[0], "matched": "only-new-window"})
+        return
+    log("warning", "app", "no window appeared before timeout", id=entry["id"], wait_s=a.wait)
+    raise CliError(f"{entry['name']} launched but no window appeared within {a.wait}s",
+                   hint="single-instance apps may reuse an existing window; check `win list`")
+
+
+# =========================================================================== clipboard, media, volume, notify
+
+def clipboard_text() -> str | None:
+    types = run(["wl-paste", "--list-types"], ctx="clip", check=False)
+    if types.returncode != 0 or not any(t.startswith("text/") or t in ("UTF8_STRING", "STRING")
+                                        for t in types.stdout.split()):
+        return None
+    return run(["wl-paste", "--no-newline"], ctx="clip", redact=True).stdout
+
+
+def cmd_clip(a) -> None:
+    if a.action == "types":
+        p = run(["wl-paste", "--list-types"], ctx="clip", check=False)
+        emit({"types": list(dict.fromkeys(p.stdout.split())) if p.returncode == 0 else []})
+    elif a.action == "get":
+        if a.out:
+            data = subprocess.run(["wl-paste", "--no-newline"] + (["--type", a.type] if a.type else []),
+                                  capture_output=True, timeout=10)
+            if data.returncode != 0:
+                log("warning", "clip", "clipboard read failed", stderr=data.stderr.decode(errors="replace")[-200:])
+                raise CliError("clipboard is empty or the type is unavailable", code=EXIT_TARGET)
+            Path(a.out).expanduser().write_bytes(data.stdout)
+            emit({"path": a.out, "bytes": len(data.stdout)})
+        else:
+            emit({"text": clipboard_text()})
+    elif a.action == "set":
+        if a.file:
+            with open(Path(a.file).expanduser(), "rb") as fh:
+                p = subprocess.run(["wl-copy"] + (["--type", a.type] if a.type else []), stdin=fh, timeout=10,
+                                   capture_output=True)
+            if p.returncode != 0:
+                log("error", "clip", "wl-copy failed", stderr=p.stderr.decode(errors="replace")[-200:])
+                raise CliError("wl-copy failed")
+            emit({"set": a.file})
+        else:
+            run(["wl-copy"] + (["--type", a.type] if a.type else []) + ["--", a.text], ctx="clip", redact=True)
+            log("info", "clip", "clipboard set", **fingerprint(a.text))
+            emit({"set": "text", "chars": len(a.text)})
+    elif a.action == "clear":
+        run(["wl-copy", "--clear"], ctx="clip")
+        emit({"cleared": True})
+
+
+def cmd_media(a) -> None:
+    sel = ["-p", a.player] if a.player else []
+    if a.action == "status":
+        fmt = "{{playerName}}\t{{status}}\t{{artist}}\t{{title}}\t{{album}}\t{{position}}\t{{mpris:length}}"
+        p = run(["playerctl", "-a", "metadata", "--format", fmt] if not a.player
+                else ["playerctl", *sel, "metadata", "--format", fmt], ctx="media", check=False)
+        players = []
+        for line in p.stdout.splitlines():
+            f = line.split("\t")
+            if len(f) == 7:
+                players.append({"player": f[0], "status": f[1], "artist": f[2], "title": f[3], "album": f[4],
+                                "position_s": round(int(f[5] or 0) / 1e6), "length_s": round(int(f[6] or 0) / 1e6)})
+        emit({"players": players})
+        return
+    verb = {"toggle": "play-pause", "prev": "previous"}.get(a.action, a.action)
+    p = run(["playerctl", *sel, verb], ctx="media", check=False)
+    if p.returncode != 0:
+        log("warning", "media", "playerctl command failed", verb=verb, stderr=p.stderr.strip())
+        raise CliError(f"no player accepted {verb}: {p.stderr.strip()}", code=EXIT_TARGET)
+    emit({"did": verb, "player": a.player or "active"})
+
+
+def cmd_volume(a) -> None:
+    dev = "@DEFAULT_AUDIO_SOURCE@" if a.mic else "@DEFAULT_AUDIO_SINK@"
+    if a.action == "set":
+        run(["wpctl", "set-volume", "-l", "1.0", dev, f"{a.percent / 100:.2f}"], ctx="volume")
+    elif a.action in ("up", "down"):
+        run(["wpctl", "set-volume", "-l", "1.0", dev, f"{a.step}%{'+' if a.action == 'up' else '-'}"], ctx="volume")
+    elif a.action in ("mute", "unmute", "toggle-mute"):
+        run(["wpctl", "set-mute", dev, {"mute": "1", "unmute": "0", "toggle-mute": "toggle"}[a.action]], ctx="volume")
+    out = run(["wpctl", "get-volume", dev], ctx="volume").stdout  # e.g. "Volume: 0.45 [MUTED]"
+    m = re.search(r"([\d.]+)", out)
+    emit({"device": "mic" if a.mic else "speaker", "percent": round(float(m.group(1)) * 100) if m else None,
+          "muted": "MUTED" in out})
+
+
+def cmd_notify(a) -> None:
+    run(["notify-send", "-a", "kde-desktop", "-u", a.urgency] + (["-i", a.icon] if a.icon else [])
+        + [a.title] + ([a.body] if a.body else []), ctx="notify")
+    log("info", "notify", "notification sent", urgency=a.urgency)
+    emit({"notified": a.title})
+
+
+# =========================================================================== doctor
+
+def set_flat_pointer_accel() -> str:
+    """Give the ydotoold virtual mouse a flat 1:1 acceleration profile so relative moves are exact."""
+    Gio, GLib = _gio()
+    bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+    names = bus.call_sync("org.kde.KWin", "/org/kde/KWin/InputDevice", "org.freedesktop.DBus.Properties", "Get",
+                          GLib.Variant("(ss)", ("org.kde.KWin.InputDeviceManager", "devicesSysNames")),
+                          GLib.VariantType("(v)"), Gio.DBusCallFlags.NONE, 3000, None).unpack()[0]
+    for sysname in names:
+        obj = f"/org/kde/KWin/InputDevice/{sysname}"
+        name = bus.call_sync("org.kde.KWin", obj, "org.freedesktop.DBus.Properties", "Get",
+                             GLib.Variant("(ss)", ("org.kde.KWin.InputDevice", "name")), GLib.VariantType("(v)"),
+                             Gio.DBusCallFlags.NONE, 3000, None).unpack()[0]
+        if "ydotool" in name.casefold():
+            bus.call_sync("org.kde.KWin", obj, "org.freedesktop.DBus.Properties", "Set",
+                          GLib.Variant("(ssv)", ("org.kde.KWin.InputDevice", "pointerAccelerationProfileFlat",
+                                                 GLib.Variant("b", True))), None, Gio.DBusCallFlags.NONE, 3000, None)
+            return f"flat acceleration set on {name} ({sysname})"
+    return "ydotoold virtual mouse not found (is ydotoold running?)"
+
+
+def cmd_doctor(a) -> None:
+    checks = []
+
+    def check(name: str, fn):
+        try:
+            ok, detail, fix = fn()
+        except CliError as exc:
+            ok, detail, fix = False, str(exc), exc.hint
+        except Exception as exc:
+            log("error", "doctor", f"check {name} crashed", exc=True)
+            ok, detail, fix = False, repr(exc), None
+        checks.append({"check": name, "ok": ok, "detail": detail, **({"fix": fix} if fix and not ok else {})})
+        log("info" if ok else "warning", "doctor", f"check {name}", ok=ok, detail=detail)
+
+    def kwin():
+        n = len(list_windows())
+        return True, f"KWin bridge ok, {n} windows", None
+
+    def a11y():
+        addr = a11y_bus_address()
+        ok, detail = a11y_socket_ok(addr)
+        if not ok and a.fix:
+            log("warning", "doctor", "restarting stale accessibility bus", detail=detail)
+            run(["systemctl", "--user", "restart", "at-spi-dbus-bus.service"], ctx="doctor")
+            time.sleep(1.0)
+            ok, detail = a11y_socket_ok(a11y_bus_address())
+            detail = "restarted stale bus; " + detail
+        if not ok:
+            return False, f"socket refused: {detail}", "kde-desktop doctor --fix (restarts at-spi-dbus-bus)"
+        enabled = a11y_enabled()
+        if not enabled and a.fix:
+            enabled = a11y_enabled(True)
+        if not enabled:
+            return False, "accessibility disabled (Qt/GTK apps expose no tree)", "kde-desktop doctor --fix"
+        return True, f"bus {detail}, enabled; apps started before enabling may need a restart", None
+
+    def ydotool():
+        if not shutil.which("ydotool"):
+            return False, "ydotool missing", INSTALL_HINTS["ydotool"]
+        ok, why = uinput_status()
+        if not ok:
+            return False, why, "reboot" if "reboot" in why else why
+        if not _socket_alive(ydotool_socket()):
+            if a.fix:
+                ensure_ydotool()
+            else:
+                return False, "ydotoold not running", "kde-desktop doctor --fix (starts the user service)"
+        detail = "ydotoold running"
+        if a.fix:
+            detail += "; " + set_flat_pointer_accel()
+        return True, detail, None
+
+    def binary(name, purpose, optional=False):
+        def inner():
+            path = shutil.which(name)
+            return (bool(path) or optional, f"{purpose}: {path or 'missing' + (' (optional)' if optional else '')}",
+                    INSTALL_HINTS.get(name))
+        return inner
+
+    def ocr():
+        if not shutil.which("tesseract"):
+            return False, "tesseract missing", INSTALL_HINTS["tesseract"]
+        langs = tesseract_langs()
+        if "eng" not in langs:
+            return False, f"no English language data (have {langs})", "sudo pacman -S tesseract-data-eng"
+        return True, "tesseract with eng", None
+
+    check("kwin", kwin)
+    check("accessibility", a11y)
+    check("input (ydotool)", ydotool)
+    check("screenshot", binary("spectacle", "screenshots"))
+    check("imagemagick", binary("magick", "crop/resize"))
+    check("ocr", ocr)
+    check("clipboard", binary("wl-copy", "wl-clipboard"))
+    check("media", binary("playerctl", "MPRIS control"))
+    check("volume", binary("wpctl", "PipeWire volume"))
+    check("notify", binary("notify-send", "notifications"))
+    check("launcher", binary("kstart", "app launching"))
+    check("kdotool", binary("kdotool", "ad-hoc window scripting", optional=True))
+    emit_lines(checks)
+
+
+# =========================================================================== CLI
+
+def add_target(p, input_flags: bool = False) -> None:
+    p.add_argument("--window", "-w", metavar="WIN", help="UUID | active | class:X | title:X | pid:N | text")
+    if input_flags:
+        p.add_argument("--focused", action="store_true", help="send to whatever is focused (explicit opt-in)")
+        p.add_argument("--allow-self", action="store_true", help="permit targeting the terminal running this CLI")
+
+
+def add_node_select(p) -> None:
+    p.add_argument("--path", help="node path from `a11y tree`/`find`, e.g. 0.3.1")
+    p.add_argument("--role", help="exact role, e.g. 'push button', 'text', 'check box', 'menu item'")
+    p.add_argument("--name", help="case-insensitive substring of the name (or text)")
+    p.add_argument("--exact", action="store_true", help="--name must match exactly")
+    p.add_argument("--action-filter", metavar="ACTION", help="only nodes offering this action")
+    p.add_argument("--nth", type=int, help="pick the Nth match (0-based) when several match")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    ap = argparse.ArgumentParser(prog="kde-desktop", description=__doc__.split("\n\n")[0],
+                                 formatter_class=argparse.RawDescriptionHelpFormatter,
+                                 epilog="Window specs: UUID | active | class:X | title:X | pid:N | free text.")
+    ap.add_argument("--version", action="version", version=VERSION)
+    sub = ap.add_subparsers(dest="group", required=True)
+
+    w = sub.add_parser("win", help="list and manage windows").add_subparsers(dest="action", required=True)
+    p = w.add_parser("list", help="managed windows as JSON lines")
+    p.add_argument("--all", action="store_true", help="include docks, panels, popups")
+    w.add_parser("active", help="the focused window")
+    for name, hlp in [("get", "one window"), ("activate", "focus and raise (unminimizes)"), ("close", "graceful close"),
+                      ("minimize", ""), ("unminimize", ""), ("maximize", ""), ("unmaximize", "")]:
+        p = w.add_parser(name, help=hlp)
+        p.add_argument("window")
+        p.add_argument("--allow-self", action="store_true")
+    for name in ("fullscreen", "above"):
+        p = w.add_parser(name)
+        p.add_argument("window")
+        p.add_argument("state", choices=["on", "off"])
+    p = w.add_parser("move", help="move frame to X Y")
+    p.add_argument("window"), p.add_argument("x", type=int), p.add_argument("y", type=int)
+    p = w.add_parser("resize", help="resize frame to W H")
+    p.add_argument("window"), p.add_argument("w", type=int), p.add_argument("h", type=int)
+    p = w.add_parser("place", help="set frame X Y W H")
+    p.add_argument("window")
+    for k in ("x", "y", "w", "h"):
+        p.add_argument(k, type=int)
+    p = w.add_parser("to-desktop", help="send to virtual desktop N (1-based)")
+    p.add_argument("window"), p.add_argument("n", type=int)
+
+    d = sub.add_parser("desk", help="virtual desktops").add_subparsers(dest="action", required=True)
+    d.add_parser("list")
+    p = d.add_parser("switch")
+    p.add_argument("n", type=int)
+
+    sub.add_parser("screens", help="screen geometry and cursor position")
+
+    for name, hlp in [("shot", "screenshot (full desktop, window or region)"), ("ocr", "OCR text with screen coordinates")]:
+        p = sub.add_parser(name, help=hlp)
+        add_target(p)
+        p.add_argument("--region", nargs=4, type=int, metavar=("X", "Y", "W", "H"))
+        p.add_argument("--no-activate", action="store_true", help="do not raise the window first")
+        if name == "shot":
+            p.add_argument("--out", help="output PNG path (default: ~/.cache/kde-desktop/shots/)")
+            p.add_argument("--max-width", type=int, default=1568, help="downscale longest edge (default 1568)")
+        else:
+            p.add_argument("--find", help="return only spans containing this text, with click centers")
+            p.add_argument("--lang", default="eng")
+
+    a11 = sub.add_parser("a11y", help="accessibility tree: inspect and operate widgets").add_subparsers(
+        dest="action", required=True)
+    a11.add_parser("apps", help="applications exposing a tree")
+    specs = [("tree", "outline of visible widgets"), ("find", "matching nodes as JSON lines"),
+             ("do", "perform an action (default press/click/activate/toggle)"), ("text", "read text"),
+             ("set-text", "replace (or --append) editable text"), ("focus", "give keyboard focus"),
+             ("value", "read or --set a slider/spinbox value"), ("info", "one node")]
+    for name, hlp in specs:
+        p = a11.add_parser(name, help=hlp)
+        add_target(p)
+        p.add_argument("--app", help="application name or pid (alternative to --window)")
+        p.add_argument("--hidden", action="store_true", help="include nodes not currently showing")
+        p.add_argument("--max-visit", type=int, default=6000, help="node visit budget")
+        if name == "tree":
+            p.add_argument("--under", metavar="PATH", help="print only this subtree")
+            p.add_argument("--depth", type=int)
+            p.add_argument("--max", type=int, default=250, help="max printed nodes")
+        elif name == "find":
+            p.add_argument("--role"), p.add_argument("--name"), p.add_argument("--exact", action="store_true")
+            p.add_argument("--action-filter", metavar="ACTION")
+            p.add_argument("--under", metavar="PATH")
+            p.add_argument("--max", type=int, default=25)
+        else:
+            add_node_select(p)
+            if name == "do":
+                p.add_argument("--action", dest="do_action", help="action name (see `find` output)")
+            if name == "text":
+                p.add_argument("--max-chars", type=int, default=20000)
+            if name == "set-text":
+                p.add_argument("value")
+                p.add_argument("--append", action="store_true")
+            if name == "value":
+                p.add_argument("--set", type=float)
+
+    i = sub.add_parser("input", help="synthetic keyboard/pointer via ydotool").add_subparsers(dest="action", required=True)
+    p = i.add_parser("type", help="type ASCII text")
+    p.add_argument("text"), add_target(p, True)
+    p.add_argument("--delay", type=int, default=12, help="ms between keys")
+    p = i.add_parser("paste", help="paste any Unicode text via the clipboard (restores it after)")
+    p.add_argument("text"), add_target(p, True)
+    p.add_argument("--terminal", action="store_true", help="use ctrl+shift+v")
+    p = i.add_parser("key", help="key chords, e.g. ctrl+l Return alt+F4")
+    p.add_argument("keys", nargs="+"), add_target(p, True)
+    p = i.add_parser("click", help="click, optionally at global X Y")
+    add_target(p, True)
+    p.add_argument("--at", nargs=2, type=int, metavar=("X", "Y"))
+    p.add_argument("--button", choices=list(BUTTONS), default="left")
+    p.add_argument("--double", action="store_true")
+    p.add_argument("--anywhere", action="store_true", help="no window check (desktop, panels)")
+    p = i.add_parser("scroll", help="wheel steps (positive = down)")
+    p.add_argument("amount", type=int), add_target(p, True)
+    p.add_argument("--at", nargs=2, type=int, metavar=("X", "Y"))
+    p.add_argument("--anywhere", action="store_true")
+    p = i.add_parser("move", help="move pointer to global X Y")
+    p.add_argument("x", type=int), p.add_argument("y", type=int)
+
+    ap_ = sub.add_parser("app", help="find and launch applications").add_subparsers(dest="action", required=True)
+    p = ap_.add_parser("list")
+    p.add_argument("query", nargs="?"), p.add_argument("--all", action="store_true")
+    p = ap_.add_parser("launch")
+    p.add_argument("query", help="desktop id, app name, or unique substring")
+    p.add_argument("--url", help="file or URL to open")
+    p.add_argument("--wait", type=float, default=0, help="seconds to wait for its window (returns it)")
+
+    c = sub.add_parser("clip", help="clipboard").add_subparsers(dest="action", required=True)
+    p = c.add_parser("get")
+    p.add_argument("--type"), p.add_argument("--out", help="write raw bytes (e.g. image/png) to a file")
+    p = c.add_parser("set")
+    p.add_argument("text", nargs="?"), p.add_argument("--file"), p.add_argument("--type")
+    c.add_parser("types"), c.add_parser("clear")
+
+    m = sub.add_parser("media", help="MPRIS players via playerctl")
+    m.add_argument("action", choices=["status", "play", "pause", "toggle", "next", "prev", "stop"])
+    m.add_argument("--player")
+
+    v = sub.add_parser("volume", help="default speaker/mic volume via wpctl")
+    v.add_argument("action", nargs="?", default="get", choices=["get", "set", "up", "down", "mute", "unmute", "toggle-mute"])
+    v.add_argument("percent", nargs="?", type=float)
+    v.add_argument("--step", type=int, default=5)
+    v.add_argument("--mic", action="store_true")
+
+    n = sub.add_parser("notify", help="desktop notification")
+    n.add_argument("title"), n.add_argument("body", nargs="?")
+    n.add_argument("--urgency", choices=["low", "normal", "critical"], default="normal")
+    n.add_argument("--icon")
+
+    dr = sub.add_parser("doctor", help="check every backend; --fix repairs what it safely can")
+    dr.add_argument("--fix", action="store_true")
+    return ap
+
+
+def cmd_a11y_safe(a) -> None:
+    try:
+        cmd_a11y(a)
+    except CliError:
+        raise
+    except Exception as exc:
+        if type(exc).__name__ != "GError" and "atspi" not in repr(exc).casefold():
+            raise
+        log("error", "a11y", "AT-SPI call failed", exc=True)
+        raise CliError(f"accessibility call failed: {exc}", hint="the app may be busy or closed; retry or check `win list`") from exc
+
+
+HANDLERS = {"win": cmd_win, "desk": cmd_desk, "screens": cmd_screens, "shot": cmd_shot, "ocr": cmd_ocr,
+            "a11y": cmd_a11y_safe, "input": cmd_input, "app": cmd_app, "clip": cmd_clip, "media": cmd_media,
+            "volume": cmd_volume, "notify": cmd_notify, "doctor": cmd_doctor}
+
+
+def main(argv: list[str] | None = None) -> int:
+    setup_logging()
+    a = build_parser().parse_args(argv)
+    t0 = time.monotonic()
+    log("debug", "main", "command start", argv=[x if len(x) < 60 else x[:20] + "…" for x in (argv or sys.argv[1:])][:6])
+    try:
+        require_env()
+        if a.group == "volume" and a.action == "set" and a.percent is None:
+            raise CliError("volume set needs a percent", code=EXIT_USAGE)
+        if a.group == "clip" and a.action == "set" and not (a.text or a.file):
+            raise CliError("clip set needs TEXT or --file", code=EXIT_USAGE)
+        HANDLERS[a.group](a)
+        log("info", "main", f"{a.group} {getattr(a, 'action', '')}".strip() + " ok",
+            ms=int((time.monotonic() - t0) * 1000))
+        return EXIT_OK
+    except CliError as exc:
+        err = {"error": str(exc), **({"hint": exc.hint} if exc.hint else {}), **exc.data, "trace_id": TRACE_ID}
+        sys.stderr.write(json.dumps(err, ensure_ascii=False, default=str) + "\n")
+        log("error" if exc.code in (EXIT_ERR, EXIT_ENV) else "info", "main", str(exc), code=exc.code)
+        return exc.code
+    except KeyboardInterrupt:
+        log("warning", "main", "interrupted")
+        return 130
+    except Exception as exc:
+        log("error", "main", "unhandled exception", exc=True)
+        sys.stderr.write(json.dumps({"error": f"internal error: {exc!r}", "trace_id": TRACE_ID,
+                                     "hint": "details in ~/.local/state/kde-desktop/kde-desktop.log"}) + "\n")
+        return EXIT_ERR
+
+
+if __name__ == "__main__":
+    sys.exit(main())
