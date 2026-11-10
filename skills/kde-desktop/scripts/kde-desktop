@@ -1061,10 +1061,15 @@ def uinput_status() -> tuple[bool, str]:
         if os.access("/dev/uinput", os.R_OK | os.W_OK):
             return True, "uinput available and writable"
         return False, "no write access to /dev/uinput (needs a logind uaccess ACL or the input group)"
-    if not Path(f"/usr/lib/modules/{os.uname().release}").exists():
+    moddir = Path(f"/usr/lib/modules/{os.uname().release}")
+    if not moddir.exists():
         return False, (f"running kernel {os.uname().release} has no modules on disk (kernel upgraded "
                        "without a reboot); reboot to load uinput")
-    return False, "uinput module not loaded: sudo modprobe uinput"
+    # /dev/uinput is a static node: the first open() makes the kernel load the module on demand,
+    # so an unloaded-but-installed module is fine as long as the node is writable.
+    if any(moddir.glob("kernel/drivers/input/misc/uinput.ko*")) and os.access("/dev/uinput", os.R_OK | os.W_OK):
+        return True, "uinput not loaded yet; it loads on demand when ydotoold opens /dev/uinput"
+    return False, "uinput module not available: sudo modprobe uinput"
 
 
 def ensure_ydotool() -> dict:
@@ -1195,14 +1200,14 @@ def cmd_input(a) -> None:
         emit({"did": "type", "chars": len(a.text), "window": win and win["title"]})
     elif a.action == "paste":
         previous = clipboard_text()
-        run(["wl-copy", "--", a.text], ctx="input", redact=True)
+        wl_copy(a.text)
         time.sleep(0.05)
         run(["ydotool", "key", "-d", "20", *key_args("ctrl+shift+v" if a.terminal else "ctrl+v")], env=env, ctx="input")
         time.sleep(0.3)  # let the target read the offer before the clipboard is restored
-        if previous is None:
-            run(["wl-copy", "--clear"], ctx="input", check=False)
-        else:
-            run(["wl-copy", "--", previous], ctx="input", redact=True, check=False)
+        try:
+            wl_copy(clear=True) if previous is None else wl_copy(previous)
+        except CliError as exc:  # the paste itself succeeded; only the restore failed
+            log("warning", "input", "clipboard restore failed", error=str(exc))
         log("info", "input", "text pasted", window=win and win["title"], restored=previous is not None,
             **fingerprint(a.text))
         emit({"did": "paste", "chars": len(a.text), "window": win and win["title"]})
@@ -1310,6 +1315,30 @@ def cmd_app(a) -> None:
 
 # =========================================================================== clipboard, media, volume, notify
 
+def wl_copy(text: str | None = None, *, mime: str | None = None, path: str | None = None,
+            clear: bool = False) -> None:
+    """Set the clipboard. wl-copy forks a background server that keeps the clipboard alive; giving
+    it no stdout/stderr pipes stops that child from holding our pipes open (which would hang)."""
+    cmd = ["wl-copy"] + (["--clear"] if clear else []) + (["--type", mime] if mime else [])
+    try:
+        if path:
+            with open(Path(path).expanduser(), "rb") as fh:
+                rc = subprocess.run(cmd, stdin=fh, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                    timeout=10).returncode
+        else:
+            rc = subprocess.run(cmd, input=None if clear else (text or "").encode(), stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL, timeout=10).returncode
+    except FileNotFoundError as exc:
+        log("error", "clip", "wl-copy missing", exc=True)
+        raise CliError("wl-copy is not installed", hint=INSTALL_HINTS["wl-copy"], code=EXIT_ENV) from exc
+    except subprocess.TimeoutExpired as exc:
+        log("error", "clip", "wl-copy timed out")
+        raise CliError("wl-copy timed out") from exc
+    if rc != 0:
+        log("error", "clip", "wl-copy failed", rc=rc)
+        raise CliError(f"wl-copy failed (rc={rc})")
+
+
 def clipboard_text() -> str | None:
     types = run(["wl-paste", "--list-types"], ctx="clip", check=False)
     if types.returncode != 0 or not any(t.startswith("text/") or t in ("UTF8_STRING", "STRING")
@@ -1335,19 +1364,14 @@ def cmd_clip(a) -> None:
             emit({"text": clipboard_text()})
     elif a.action == "set":
         if a.file:
-            with open(Path(a.file).expanduser(), "rb") as fh:
-                p = subprocess.run(["wl-copy"] + (["--type", a.type] if a.type else []), stdin=fh, timeout=10,
-                                   capture_output=True)
-            if p.returncode != 0:
-                log("error", "clip", "wl-copy failed", stderr=p.stderr.decode(errors="replace")[-200:])
-                raise CliError("wl-copy failed")
+            wl_copy(mime=a.type, path=a.file)
             emit({"set": a.file})
         else:
-            run(["wl-copy"] + (["--type", a.type] if a.type else []) + ["--", a.text], ctx="clip", redact=True)
+            wl_copy(a.text, mime=a.type)
             log("info", "clip", "clipboard set", **fingerprint(a.text))
             emit({"set": "text", "chars": len(a.text)})
     elif a.action == "clear":
-        run(["wl-copy", "--clear"], ctx="clip")
+        wl_copy(clear=True)
         emit({"cleared": True})
 
 
