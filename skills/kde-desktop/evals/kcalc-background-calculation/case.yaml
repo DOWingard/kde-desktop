@@ -1,0 +1,4 @@
+schema_version: "1.1"
+name: kcalc-background-calculation
+expected_outcome: |
+  KCalc computes 1234 × 5678 by having its buttons pressed; the answer read from KCalc's display (7006652) is reported; KCalc is closed; the originally active window is active at the end.

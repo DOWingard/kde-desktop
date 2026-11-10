@@ -1,0 +1,4 @@
+schema_version: "1.1"
+name: kate-write-and-save-file
+expected_outcome: |
+  Kate is launched, the haiku is entered through Kate and saved by Kate to outputs/haiku.txt, Kate is closed, and the browser window that was active at the start is active again at the end.

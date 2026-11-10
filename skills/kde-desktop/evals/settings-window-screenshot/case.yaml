@@ -1,0 +1,4 @@
+schema_version: "1.1"
+name: settings-window-screenshot
+expected_outcome: |
+  outputs/settings.png is a capture of only the System Settings window; the reply names the open page (Quick Settings) and the selected global theme; the originally active window is active again at the end.
